@@ -1,0 +1,142 @@
+#include <Arduino.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+
+// ——— Pin definitions ———
+static const int ONE_WIRE_BUS = 25;  // DS18B20 data pin (GPIO25)
+static const int HEATER_PIN   = 16;  // LED simulating heater
+static const int BUZZER_PIN   = 17;  // Buzzer output
+
+// ——— Temperature thresholds (°C) ———
+static constexpr float T_IDLE       = 30.0;
+static constexpr float T_STAB_LOW   = 45.0;
+static constexpr float T_STAB_HIGH  = 47.0;
+static constexpr float T_TARGET_LOW = 47.0;
+static constexpr float T_TARGET_HIGH= 50.0;
+static constexpr float T_OVERHEAT   = 50.0;
+
+// ——— FSM states ———
+enum State { IDLE, HEATING, STABILIZING, TARGET_REACHED, OVERHEAT };
+volatile State currentState = IDLE;
+
+// ——— DS18B20 setup ———
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+// ——— BLE advertising ———
+BLEAdvertising *pAdvertising;
+uint8_t manufData[2] = {0,0};
+static const uint16_t COMPANY_ID = 0x1234; // example
+
+// ——— Timing ———
+unsigned long lastRead = 0;
+const unsigned long READ_INTERVAL = 1000; // ms
+
+// ——— Helpers ———
+void updateStateAndActuate(float temp);
+const char* stateName(State s);
+
+void setup() {
+  Serial.begin(115200);
+  sensors.begin();
+
+  pinMode(HEATER_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(HEATER_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // — Initialize BLE —
+  BLEDevice::init("HeaterFSM");
+  BLEServer *pServer = BLEDevice::createServer();
+  pAdvertising = BLEDevice::getAdvertising();
+  // seed manufacturer data
+  pAdvertising->setManufacturerData(std::string((char*)manufData, 2));
+  pAdvertising->start();
+
+  Serial.println("🔥 DS18B20 FSM + BLE initialized");
+}
+
+void loop() {
+  unsigned long now = millis();
+  if (now - lastRead >= READ_INTERVAL) {
+    lastRead = now;
+
+    // 1) Read temperature
+    sensors.requestTemperatures();
+    float temp = sensors.getTempCByIndex(0);
+
+    // 2) Update FSM & hardware
+    updateStateAndActuate(temp);
+
+    // 3) Log
+    Serial.printf("Temp: %.1f°C | State: %s\n", temp, stateName(currentState));
+
+    // 4) Update BLE advertisement
+    manufData[0] = (uint8_t)currentState;
+    manufData[1] = ~manufData[0];
+    pAdvertising->stop();
+    pAdvertising->setManufacturerData(std::string((char*)manufData, 2));
+    pAdvertising->start();
+  }
+}
+
+// — FSM transitions & outputs — 
+void updateStateAndActuate(float temp) {
+  switch (currentState) {
+    case IDLE:
+      if (temp >= T_IDLE) currentState = HEATING;
+      break;
+
+    case HEATING:
+      if      (temp >= T_STAB_LOW && temp < T_STAB_HIGH) currentState = STABILIZING;
+      else if (temp >= T_OVERHEAT)                      currentState = OVERHEAT;
+      break;
+
+    case STABILIZING:
+      if      (temp >= T_TARGET_LOW && temp <= T_TARGET_HIGH) currentState = TARGET_REACHED;
+      else if (temp < T_STAB_LOW)                             currentState = HEATING;
+      else if (temp > T_OVERHEAT)                             currentState = OVERHEAT;
+      break;
+
+    case TARGET_REACHED:
+      if (temp > T_TARGET_HIGH)    digitalWrite(HEATER_PIN, LOW);
+      else if (temp < T_TARGET_LOW) digitalWrite(HEATER_PIN, HIGH);
+      if (temp > T_OVERHEAT)        currentState = OVERHEAT;
+      break;
+
+    case OVERHEAT:
+      // latch until reset
+      break;
+  }
+
+  // Actuation
+  if (currentState == HEATING ||
+      currentState == STABILIZING ||
+      currentState == TARGET_REACHED) {
+    digitalWrite(HEATER_PIN, HIGH);
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+  else if (currentState == OVERHEAT) {
+    digitalWrite(HEATER_PIN, LOW);
+    digitalWrite(BUZZER_PIN, HIGH);
+  }
+  else { // IDLE
+    digitalWrite(HEATER_PIN, LOW);
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+}
+
+// — Human-readable state names ——
+const char* stateName(State s) {
+  switch (s) {
+    case IDLE:           return "Idle";
+    case HEATING:        return "Heating";
+    case STABILIZING:    return "Stabilizing";
+    case TARGET_REACHED: return "Target Reached";
+    case OVERHEAT:       return "Overheat";
+    default:             return "Unknown";
+  }
+}
